@@ -5,11 +5,23 @@ import csv
 from typing import Union, Dict, Any, Optional, List
 
 import torch
-from mmdet.apis import init_detector, inference_detector
-from mmdet.structures import DetDataSample
-from mmengine.visualization import Visualizer
+from mmdet.apis import DetInferencer
+from mmengine import DefaultScope
+import mmdet  # ensure mmdet registries are imported
 import cv2
+from mmengine.visualization import Visualizer
+# Additional imports for config patching
+from mmengine.config import Config
+from mmdet.datasets import CocoDataset
+from mmengine.dataset import pseudo_collate
+from mmdet.structures import DetDataSample
+from mmcv.transforms import Compose
 
+class QuietDetInferencer(DetInferencer):
+    def _init_visualizer(self, cfg):
+        # Create a minimal visualizer that does not depend on self.model
+        # (MMDet 3.3 + MMEngine 0.10 sometimes calls this before model is set)
+        return Visualizer(name="noop-vis", vis_backends=[], save_dir=None)
 
 class MmdetBBoxDetector:
     def __init__(
@@ -19,34 +31,172 @@ class MmdetBBoxDetector:
         device: str = "cuda:0",
         score_thr: float = 0.3,
     ):
-        # Load model
-        self.model = init_detector(config, checkpoint, device=device)
-        self.score_thr = score_thr
-        self.classes = getattr(self.model.dataset_meta, "classes", None)
+        # Ensure the MMEngine default scope is set so registries resolve to mmdet
+        try:
+            if not DefaultScope.check_instance_created('mmdet'):
+                DefaultScope.get_instance('mmdet', scope_name='mmdet')
+        except Exception:
+            # Best-effort: ignore if scope is already set in a different name
+            pass
 
-        # Prepare visualizer
-        self.visualizer = Visualizer(name="mmdet-vis", vis_backends=[], save_dir=None)
-        if self.classes is not None:
-            self.visualizer.set_dataset_meta(dict(classes=self.classes))
+        # Load config and ensure test_dataloader exists with a minimal pipeline & metainfo
+        if isinstance(config, str):
+            cfg = Config.fromfile(config)
+        else:
+            cfg = config  # already a Config
+
+        # Build a minimal COCO-style test pipeline
+        minimal_test_pipeline = [
+            dict(type='LoadImageFromFile'),
+            dict(type='Resize', scale=(1333, 800), keep_ratio=True),
+            dict(type='PackDetInputs'),
+        ]
+
+        # Inject test_dataloader if missing or incomplete
+        need_inject = False
+        if 'test_dataloader' not in cfg:
+            need_inject = True
+        else:
+            ds = cfg.test_dataloader.get('dataset', {})
+            if not isinstance(ds, dict) or 'type' not in ds or 'pipeline' not in ds:
+                need_inject = True
+
+        if need_inject:
+            cfg.test_dataloader = dict(
+                dataset=dict(
+                    type='CocoDataset',
+                    metainfo=dict(classes=CocoDataset.METAINFO['classes']),
+                    pipeline=minimal_test_pipeline,
+                    lazy_init=True,
+                )
+            )
+            # Keep val consistent to avoid warnings if used later
+            cfg.val_dataloader = cfg.test_dataloader
+
+        # Now create the inferencer with the patched cfg
+        self.infer = QuietDetInferencer(model=cfg, weights=checkpoint, device=device)
+        # Separate pipeline for ndarray inputs (used by our predict on video frames)
+        self.nd_pipeline = Compose([
+            dict(type='LoadImageFromNDArray'),
+            dict(type='Resize', scale=(1333, 800), keep_ratio=True),
+            dict(type='PackDetInputs'),
+        ])
+        self.score_thr = score_thr
+        # Pull class names from model metainfo if available
+        self.classes = []
+        model = getattr(self.infer, 'model', None)
+        if model is not None and getattr(model, 'dataset_meta', None):
+            classes = model.dataset_meta.get('classes', None)
+            if classes is not None:
+                self.classes = list(classes)
+
 
     @torch.inference_mode()
-    def predict(self, img: Union[str, np.ndarray]) -> Dict[str, Any]:
-        """Run inference and return boxes, scores, labels."""
-        result: DetDataSample = inference_detector(self.model, img)
-        inst = result.pred_instances
+    def predict(self, img: Union[str, np.ndarray, torch.Tensor, list, tuple]) -> Dict[str, Any]:
+        """Run inference using our NDArray pipeline and let MMDet's data_preprocessor
+        run exactly once inside model.test_step (avoids list->conv2d issues).
+        Also ensures dtype and device safety for torch inputs.
+        """
+        # If a path is given, read to ndarray for a unified path
+        if isinstance(img, str):
+            frame = cv2.imread(img)
+            if frame is None:
+                raise FileNotFoundError(img)
+        else:
+            frame = img
 
-        bboxes = inst.bboxes.cpu().numpy()
-        scores = inst.scores.cpu().numpy()
-        labels = inst.labels.cpu().numpy()
+        # Ensure 3-channel BGR
+        frame = self._ensure_bgr3(frame)
 
-        keep = scores >= self.score_thr
+        # Pipeline -> collate (do NOT call data_preprocessor here)
+        data = self.nd_pipeline(dict(img=frame, img_id=0))
+        batch = pseudo_collate([data])
+
+        # IMPORTANT: use model's preprocessor to stack into a Tensor
+        processed = self.infer.model.data_preprocessor(batch, False)
+        inputs = processed['inputs']
+        data_samples = processed['data_samples']
+
+        # Some configs (e.g., with batch augments/flip-test) return a list of tensors.
+        # Coerce to a single Tensor of shape (N, C, H, W).
+        if isinstance(inputs, list):
+            flat: list[torch.Tensor] = []
+
+            def _flatten(xs):
+                for x in xs:
+                    if isinstance(x, list):
+                        _flatten(x)
+                    else:
+                        flat.append(x)
+
+            _flatten(inputs)
+
+            if not flat:
+                raise RuntimeError('Preprocessor produced an empty inputs list')
+
+            # Ensure all tensors are 3D (C,H,W) or 4D (N,C,H,W)
+            if all(isinstance(t, torch.Tensor) and t.dim() == 4 for t in flat):
+                # Concatenate batch tensors along batch dim
+                inputs = torch.cat(flat, dim=0)
+            elif all(isinstance(t, torch.Tensor) and t.dim() == 3 for t in flat):
+                # Stack single images into a batch
+                inputs = torch.stack(flat, dim=0)
+            else:
+                shapes = [tuple(t.shape) if isinstance(t, torch.Tensor) else type(t) for t in flat]
+                raise RuntimeError(f'Unexpected preprocessor output shapes: {shapes}')
+
+        # Final guard: inputs must be a Tensor of shape (N,C,H,W)
+        if not (isinstance(inputs, torch.Tensor) and inputs.dim() == 4):
+            raise RuntimeError(f'inputs to model must be 4D Tensor, got {type(inputs)} with dim={getattr(inputs, "dim", lambda: None)()}')
+
+        # --- DTYPE & DEVICE NORMALIZATION BLOCK (inserted here) ---
+        # Ensure input is a float tensor in the correct range
+        img_for_infer = inputs
+        if isinstance(img_for_infer, torch.Tensor):
+            if img_for_infer.dtype == torch.uint8:
+                img_for_infer = img_for_infer.float() / 255.0
+        elif isinstance(img_for_infer, (list, tuple)):
+            img_for_infer = [t.float() / 255.0 if t.dtype == torch.uint8 else t for t in img_for_infer]
+
+        # Move to model device
+        model_device = next(self.infer.model.parameters()).device
+        if isinstance(img_for_infer, torch.Tensor):
+            img_for_infer = img_for_infer.to(model_device)
+        elif isinstance(img_for_infer, (list, tuple)):
+            img_for_infer = [t.to(model_device) for t in img_for_infer]
+        # ----------------------------------------------------------
+
+        # Single inference call; apply thresholding in this function only
+        results = self.infer.model.predict(img_for_infer, data_samples)
+        result = results[0] if isinstance(results, (list, tuple)) else results
+
+        if isinstance(result, DetDataSample):
+            inst = result.pred_instances
+            bboxes = inst.bboxes.cpu().numpy() if hasattr(inst, 'bboxes') else np.empty((0, 4))
+            scores = inst.scores.cpu().numpy() if hasattr(inst, 'scores') else np.empty((0,))
+            labels = inst.labels.cpu().numpy() if hasattr(inst, 'labels') else np.empty((0,), dtype=int)
+        else:
+            bboxes = np.empty((0, 4))
+            scores = np.empty((0,))
+            labels = np.empty((0,), dtype=int)
+
+        # Keep only the 'person' class (COCO index 0). If class names are available,
+        # look up the index dynamically; otherwise default to 0.
+        if self.classes:
+            try:
+                person_idx = self.classes.index('person')
+            except ValueError:
+                person_idx = 0
+        else:
+            person_idx = 0
+
+        cls_mask = (labels == person_idx)
+        keep = cls_mask & (scores >= self.score_thr)
         return {
-            "boxes": bboxes[keep],
-            "scores": scores[keep],
-            "labels": labels[keep],
-            "detsample": result,
+            'boxes': bboxes[keep],
+            'scores': scores[keep],
+            'labels': labels[keep],
         }
-
     def draw(
         self,
         img: np.ndarray,
@@ -55,26 +205,37 @@ class MmdetBBoxDetector:
     ) -> np.ndarray:
         """Draw bounding boxes on an image."""
         if pred is None:
-            pred = self.predict(img)
+            # Optionally override threshold for this call
+            old_thr = self.score_thr
+            if score_thr is not None:
+                self.score_thr = score_thr
+            try:
+                pred = self.predict(img)
+            finally:
+                self.score_thr = old_thr
+        else:
+            # If a prediction dict is provided, use it as-is to avoid double filtering.
+            # Only apply an extra filter if caller explicitly passes a different score_thr.
+            if score_thr is not None:
+                thr = float(score_thr)
+                import numpy as np
+                keep = pred.get('scores', np.empty((0,))) >= thr
+                pred = {
+                    'boxes': pred.get('boxes', np.empty((0, 4)))[keep],
+                    'scores': pred.get('scores', np.empty((0,)))[keep],
+                    'labels': pred.get('labels', np.empty((0,), dtype=int))[keep],
+                }
 
-        result = pred["detsample"].clone()
-        thr = self.score_thr if score_thr is None else score_thr
-        inst = result.pred_instances
-        keep = inst.scores >= thr
-        inst.bboxes = inst.bboxes[keep]
-        inst.scores = inst.scores[keep]
-        inst.labels = inst.labels[keep]
-
-        self.visualizer.set_image(img[:, :, ::-1])  # BGR→RGB
-        self.visualizer.draw_bboxes(
-            inst.bboxes.numpy(),
-            labels=[
-                f"{self.classes[l]} {s:.2f}"
-                for l, s in zip(inst.labels.numpy(), inst.scores.numpy())
-            ],
-        )
-        out_rgb = self.visualizer.get_image()
-        return out_rgb[:, :, ::-1]  # RGB→BGR
+        vis = img.copy()
+        for (x1, y1, x2, y2), s, l in zip(pred['boxes'], pred['scores'], pred['labels']):
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cls_name = str(int(l))
+            if self.classes and int(l) < len(self.classes):
+                cls_name = self.classes[int(l)]
+            cv2.putText(vis, f"{cls_name}:{s:.2f}", (x1, max(0, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        return vis
 
     @staticmethod
     def imread(path: str) -> np.ndarray:
@@ -201,7 +362,8 @@ class MmdetBBoxDetector:
                 timestamp = idx / fps
 
                 # Write `<timestamp>,<count_boxes>`
-                writer.writerow([f"{timestamp:.6f}", str(count)])
+                scores_list = [f"{s:.4f}" for s in pred.get("scores", [])]
+                writer.writerow([f"{timestamp:.6f}", str(count), ";".join(scores_list)])
 
                 idx += 1
 
@@ -245,10 +407,11 @@ class MmdetBBoxDetector:
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         if not fps or fps <= 0:
-            fps = 30.0
+            fps = 30
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
+        #if width is None or height is None or width <= 0 or height <= 0:
+            #width, height = 640, 480  # sane defaults
         fourcc = cv2.VideoWriter_fourcc(*codec)
         writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
         if not writer.isOpened():
@@ -282,7 +445,7 @@ class MmdetBBoxDetector:
                         last_pred = self.predict(frame)
 
                 # Draw boxes using our drawer
-                vis = self.draw(frame, pred=last_pred, score_thr=score_thr)
+                vis = self.draw(frame, pred=last_pred, score_thr=None)
 
                 # Overlay count at bottom-right
                 count = 0 if last_pred is None else int(len(last_pred["boxes"]))
@@ -303,25 +466,47 @@ class MmdetBBoxDetector:
         return out_path
 
 
+def main():
+    import argparse
+
+    ap = argparse.ArgumentParser(description="MMDetection bbox detector utilities")
+    ap.add_argument("--config", default="configs/faster_rcnn/faster_rcnn_r50_fpn_2x_coco.py")
+    ap.add_argument("--ckpt", default="checkpoints/faster_rcnn_r50_fpn_2x_coco_bbox_mAP-0.384_20200504_210434-a5d8aa15.pth")
+    ap.add_argument("--device", default="cuda:0", help="cuda:0 or cpu")
+    ap.add_argument("--thr", type=float, default=0.5, help="score threshold")
+
+    # Modes
+    ap.add_argument("--img", help="Path to an image to annotate")
+    ap.add_argument("--video", help="Path to a video to process")
+    ap.add_argument("--out", help="Output path (image or video)")
+    ap.add_argument("--csv", action="store_true", help="When --video is set, also write <video>.csv (timestamp,count)")
+    ap.add_argument("--every-n", type=int, default=1, help="sample every N frames for video ops")
+
+    args = ap.parse_args()
+
+    det = MmdetBBoxDetector(args.config, args.ckpt, device=args.device, score_thr=args.thr)
+
+    # Image mode
+    if args.img:
+        img = det.imread(args.img)
+        vis = det.draw(img)
+        out_img = args.out or "output.jpg"
+        cv2.imwrite(out_img, vis)
+        print("Wrote image:", out_img)
+
+    # Video mode
+    if args.video:
+        # CSV output
+        if args.csv:
+            csv_dir = os.path.dirname(args.out) if args.out else None
+            csv_path = det.video_to_csv(args.video, out_dir=csv_dir, every_n=args.every_n, score_thr=args.thr)
+            print("Wrote CSV:", csv_path)
+        # Annotated video
+        if args.out:
+            det.annotate_video(args.video, args.out, score_thr=args.thr, every_n=args.every_n)
+            print("Wrote video:", args.out)
+        elif not args.csv:
+            print("[info] --video provided but neither --out nor --csv specified; nothing to write.")
+
 if __name__ == "__main__":
-    # Example usage
-    config = "configs/faster_rcnn/faster_rcnn_r50_fpn_2x_coco.py"
-    checkpoint = "checkpoints/faster_rcnn_r50_fpn_2x_coco_bbox_mAP-0.384_20200504_210434-a5d8aa15.pth"
-
-    det = MmdetBBoxDetector(config, checkpoint, device="cuda:0", score_thr=0.5)
-
-    csv_path = det.video_to_csv(
-    video_path="data/Breakroom_f.mp4",
-    out_dir="data/csv",      # or None to write next to the video
-    every_n=1,               # sample every frame
-    score_thr=0.8            # optional override
-    )
-    print("Wrote:", csv_path)
-    out_path = det.annotate_video(
-    video_path="data/test.mp4",
-    out_path="data/out/test_annotated.mp4",
-    score_thr=0.4,    # optional
-    every_n=1,        # detect every frame; increase to speed up
-    codec="mp4v"      # or "avc1", "XVID" depending on your system
-    )
-    print("Wrote:", out_path)
+    main()

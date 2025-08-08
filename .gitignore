@@ -1,33 +1,33 @@
-# venvs & build
-venv/
-.venv/
-env/
-detection/
-dist/
-build/
-*.egg-info/
+# venvs
+.venv*/
+venv*/
+env*/
 
-# python cache
+# python build/metadata
+*.egg-info/
 __pycache__/
 *.pyc
+build/
+dist/
 
-# model weights & big artifacts
+# mmdet / training outputs & caches
+work_dirs/
 checkpoints/
-*.pth
-*.pt
-*.onnx
-*.so
+.mim/
 
-# data/media
+# local data & outputs
 data/
-videos/
-*.mp4
-*.mov
-*.avi
-*.jpg
-*.png
+outputs/
+logs/
 *.csv
 
-# IDE
+# media
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# editors
+.DS_Store
 .vscode/
 .idea/
