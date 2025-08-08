@@ -1,0 +1,11 @@
+README.md
+setup.py
+breakroom.egg-info/PKG-INFO
+breakroom.egg-info/SOURCES.txt
+breakroom.egg-info/dependency_links.txt
+breakroom.egg-info/entry_points.txt
+breakroom.egg-info/requires.txt
+breakroom.egg-info/top_level.txt
+scripts/__init__.py
+scripts/bbox_detection.py
+utils/__init__.py
