@@ -4,6 +4,10 @@ import os
 import csv
 from typing import Union, Dict, Any, Optional, List
 
+import subprocess
+import shutil
+import tempfile
+
 import torch
 from mmdet.apis import DetInferencer
 from mmengine import DefaultScope
@@ -30,6 +34,9 @@ class MmdetBBoxDetector:
         checkpoint: str,
         device: str = "cuda:0",
         score_thr: float = 0.3,
+        force_transcode: bool = False,
+        fast_transcode: bool = False,
+        use_nvenc: Optional[bool] = None,
     ):
         # Ensure the MMEngine default scope is set so registries resolve to mmdet
         try:
@@ -82,6 +89,9 @@ class MmdetBBoxDetector:
             dict(type='PackDetInputs'),
         ])
         self.score_thr = score_thr
+        self.force_transcode = force_transcode
+        self.fast_transcode = fast_transcode
+        self.use_nvenc = use_nvenc
         # Pull class names from model metainfo if available
         self.classes = []
         model = getattr(self.infer, 'model', None)
@@ -89,6 +99,247 @@ class MmdetBBoxDetector:
             classes = model.dataset_meta.get('classes', None)
             if classes is not None:
                 self.classes = list(classes)
+
+    # --- Robust video preparation helpers ---------------------------------
+    def _nvenc_available(self) -> bool:
+        if not shutil.which('ffmpeg'):
+            return False
+        try:
+            out = subprocess.check_output(['ffmpeg','-hide_banner','-encoders'], stderr=subprocess.STDOUT, text=True)
+            return 'h264_nvenc' in out
+        except Exception:
+            return False
+    def _probe_pix_fmt(self, path: str) -> Optional[str]:
+        """Return pixel format via ffprobe if available, else None."""
+        if not shutil.which('ffprobe'):
+            return None
+        try:
+            cmd = [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=pix_fmt,width,height,r_frame_rate',
+                '-of', 'default=noprint_wrappers=1', path
+            ]
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+            for line in out.splitlines():
+                if line.startswith('pix_fmt='):
+                    return line.split('=', 1)[1].strip()
+        except Exception:
+            return None
+        return None
+    def _ffprobe_stream_info(self, path: str) -> dict:
+        """Return dict with pix_fmt, width, height, fps_str, fps (float) using ffprobe when available."""
+        
+        info = {'pix_fmt': None, 'width': None, 'height': None, 'fps_str': None, 'fps': None}
+        if not shutil.which('ffprobe'):
+            return info
+        try:
+            cmd = [
+                'ffprobe','-v','error','-select_streams','v:0',
+                '-show_entries','stream=pix_fmt,width,height,r_frame_rate',
+                '-of','default=noprint_wrappers=1', path
+            ]
+            txt = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+            for line in txt.splitlines():
+                if '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                v = v.strip()
+                if k == 'pix_fmt':
+                    info['pix_fmt'] = v
+                elif k == 'width':
+                    try: info['width'] = int(v)
+                    except Exception: pass
+                elif k == 'height':
+                    try: info['height'] = int(v)
+                    except Exception: pass
+                elif k == 'r_frame_rate':
+                    info['fps_str'] = v
+            # parse fps
+            fps_str = info['fps_str']
+            if fps_str:
+                if '/' in fps_str:
+                    num, den = fps_str.split('/')
+                    try:
+                        num = float(num); den = float(den)
+                        if den == 0: den = 1.0
+                        info['fps'] = num/den
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        info['fps'] = float(fps_str)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return info
+    
+    def _transcode_to_yuv420_ffmpeg(self, src_path: str) -> Optional[str]:
+        """Use ffmpeg to transcode a video to yuv420p with even dims. Returns temp path or None on failure.
+        Supports fast mode and NVENC acceleration with fallback."""
+        if not shutil.which('ffmpeg'):
+            print('[ffmpeg] not found on PATH')
+            return None
+        tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+
+        # Try to keep fps; fall back to ffmpeg default if probe fails
+        fps = None
+        if shutil.which('ffprobe'):
+            try:
+                out = subprocess.check_output([
+                    'ffprobe','-v','error','-select_streams','v:0',
+                    '-show_entries','stream=r_frame_rate',
+                    '-of','default=nk=1:nw=1', src_path
+                ], stderr=subprocess.STDOUT, text=True)
+                fps = out.strip()
+            except Exception:
+                fps = None
+
+        # Base command with two modes: fast vs robust
+        analyzeduration = '2M' if getattr(self, 'fast_transcode', False) else '100M'
+        probesize = '2M' if getattr(self, 'fast_transcode', False) else '100M'
+        ff_base = [
+            'ffmpeg', '-hide_banner', '-y',
+            '-analyzeduration', analyzeduration, '-probesize', probesize,
+            '-fflags', '+genpts+discardcorrupt',
+            '-err_detect', 'ignore_err',
+        ]
+
+        # Choose encoder: nvenc if requested/available, else libx264
+        want_nvenc = self.use_nvenc if self.use_nvenc is not None else True
+        enc_is_nvenc = False
+        if want_nvenc and self._nvenc_available():
+            enc_is_nvenc = True
+
+        vf_filter = 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
+        # Use NVIDIA scaler for speed if nvenc path
+        if enc_is_nvenc:
+            # scale_npp is fast; if missing it will error and we will fall back
+            vf_nv = f'scale_npp=trunc(iw/2)*2:trunc(ih/2)*2:interp_algo=super;format=yuv420p'
+            enc_opts = [
+                '-hwaccel','cuda',
+                '-i', src_path,
+                '-vf', vf_nv,
+                '-c:v','h264_nvenc',
+                '-preset','p1',
+                '-tune','ll',
+                '-rc','constqp','-qp','28',
+                '-movflags','+faststart',
+            ]
+        else:
+            enc_opts = [
+                '-i', src_path,
+                '-vf', vf_filter,
+                '-pix_fmt','yuv420p',
+                '-vsync','1',
+                '-c:v','libx264','-preset','veryfast','-crf','22',
+                '-movflags','+faststart',
+            ]
+
+        cmd = ff_base + enc_opts
+        if fps and fps != '0/0':
+            cmd += ['-r', fps]
+        cmd += ['-an', tmp_path]
+
+        print('[ffmpeg] transcode start:\n  ' + ' '.join(cmd))
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode != 0 and enc_is_nvenc:
+                # Fall back to libx264 if nvenc path failed (e.g., no scale_npp)
+                print('[ffmpeg] nvenc path failed; falling back to libx264. stderr head:\n' + (res.stderr or '')[:1000])
+                cmd = ff_base + [
+                    '-i', src_path,
+                    '-vf', vf_filter,
+                    '-pix_fmt','yuv420p',
+                    '-vsync','1',
+                    '-c:v','libx264','-preset','veryfast','-crf','22',
+                    '-movflags','+faststart',
+                ]
+                if fps and fps != '0/0':
+                    cmd += ['-r', fps]
+                cmd += ['-an', tmp_path]
+                print('[ffmpeg] retry transcode (libx264):\n  ' + ' '.join(cmd))
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode != 0:
+                print('[ffmpeg] transcode failed (returncode=%s). stderr:' % res.returncode)
+                if res.stderr:
+                    print(res.stderr.strip()[:4000])
+                raise RuntimeError('ffmpeg returned non-zero')
+        except Exception as e:
+            print('[ffmpeg] exception during transcode:', e)
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            return None
+
+        # Verify the output really is decodable and yuv420p
+        if shutil.which('ffprobe'):
+            try:
+                verify = subprocess.check_output([
+                    'ffprobe','-v','error','-select_streams','v:0',
+                    '-show_entries','stream=pix_fmt,width,height',
+                    '-of','default=noprint_wrappers=1', tmp_path
+                ], stderr=subprocess.STDOUT, text=True)
+                ok_pix = None
+                for line in verify.splitlines():
+                    if line.startswith('pix_fmt='):
+                        ok_pix = line.split('=',1)[1].strip().lower()
+                        break
+                if ok_pix not in ('yuv420p', 'yuvj420p'):
+                    print('[ffmpeg] verify failed: unexpected pix_fmt:', ok_pix)
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    return None
+            except Exception as e:
+                print('[ffmpeg] verify probe failed:', e)
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                return None
+
+        print('[ffmpeg] transcoded to yuv420p with even dims:', tmp_path)
+        return tmp_path
+
+
+    def _prepare_video_path(self, video_path: str, force: Optional[bool] = None) -> str:
+        """Ensure input video is decodable and yuv420p. If not, transcode to a temp file and return its path."""
+        if force is None:
+            force = getattr(self, 'force_transcode', False)
+
+        # Probe with ffprobe only (no OpenCV). If ffprobe is missing, just force transcode when requested.
+        info = self._ffprobe_stream_info(video_path)
+        pix = (info.get('pix_fmt') or '').lower()
+        w = info.get('width'); h = info.get('height')
+        needs_yuv420 = (pix not in ('yuv420p', 'yuvj420p')) if pix else True
+        need_even_fix = False
+        if isinstance(w, int) and isinstance(h, int):
+            need_even_fix = (w % 2 != 0) or (h % 2 != 0)
+
+        print(f"[transcode] probe pix_fmt={pix or 'unknown'} size={w}x{h} force={force} needs_yuv420={needs_yuv420} need_even_fix={need_even_fix}")
+
+        # Decide whether to transcode
+        must_transcode = force or needs_yuv420 or need_even_fix
+        if not must_transcode:
+            print('[transcode] skip: already yuv420p with even dimensions')
+            return video_path
+
+        out = self._transcode_to_yuv420_ffmpeg(video_path)
+        if out:
+            return out
+
+        # If transcode was requested/needed but failed, do NOT silently continue.
+        # Raise so the caller sees a clear error instead of swscaler spam.
+        if force:
+            raise RuntimeError('ffmpeg transcode failed while --force-transcode is set')
+        else:
+            print('[transcode] WARNING: ffmpeg transcode failed; falling back to original input')
+            return video_path
 
 
     @torch.inference_mode()
@@ -105,8 +356,6 @@ class MmdetBBoxDetector:
         else:
             frame = img
 
-        # Ensure 3-channel BGR
-        frame = self._ensure_bgr3(frame)
 
         # Pipeline -> collate (do NOT call data_preprocessor here)
         data = self.nd_pipeline(dict(img=frame, img_id=0))
@@ -244,22 +493,6 @@ class MmdetBBoxDetector:
             raise FileNotFoundError(path)
         return img
 
-    @staticmethod
-    def _ensure_bgr3(frame: np.ndarray) -> np.ndarray:
-        """Ensure frame is standard 8-bit 3-channel BGR.
-        Converts grayscale or YUV planes to BGR when needed.
-        """
-        if frame is None:
-            return frame
-        if frame.ndim == 2:  # grayscale
-            return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        if frame.ndim == 3 and frame.shape[2] == 3:
-            return frame
-        # Fallback conversion for unusual formats
-        try:
-            return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR)
-        except Exception:
-            return frame
 
     def video(self, video_path: str, out_dir: str, every_n: int = 1) -> List[np.ndarray]:
         """
@@ -275,7 +508,8 @@ class MmdetBBoxDetector:
             List of images where each item is loaded via `self.imread()`.
         """
         os.makedirs(out_dir, exist_ok=True)
-        cap = cv2.VideoCapture(video_path)
+        safe_video = self._prepare_video_path(video_path, force=self.force_transcode)
+        cap = cv2.VideoCapture(safe_video)
         if not cap.isOpened():
             raise FileNotFoundError(f"Cannot open video: {video_path}")
 
@@ -285,7 +519,6 @@ class MmdetBBoxDetector:
             ret, frame = cap.read()
             if not ret:
                 break
-            frame = self._ensure_bgr3(frame)
             if idx % every_n == 0:
                 frame_path = os.path.join(out_dir, f"frame_{idx:06d}.jpg")
                 # Save the frame to disk
@@ -307,6 +540,7 @@ class MmdetBBoxDetector:
         """
         Process `video_path`, count detections per frame, and write a CSV named
         `<video_name>.csv` with lines `<timestamp>,<count_boxes>`.
+        Note: If input video is transcoded, a temp file may be created (OS will clean up or you may remove).
 
         Args:
             video_path: Input video file path.
@@ -324,9 +558,10 @@ class MmdetBBoxDetector:
         csv_path = os.path.join(target_dir, f"{base}.csv")
 
         # Open video and read FPS
-        cap = cv2.VideoCapture(video_path)
+        safe_video = self._prepare_video_path(video_path, force=self.force_transcode)
+        cap = cv2.VideoCapture(safe_video)
         if not cap.isOpened():
-            raise FileNotFoundError(f"Cannot open video: {video_path}")
+            raise FileNotFoundError(f"Cannot open video: {safe_video}")
         fps = cap.get(cv2.CAP_PROP_FPS)
         if not fps or fps <= 0:
             fps = 30.0  # sane default if FPS is missing
@@ -343,8 +578,6 @@ class MmdetBBoxDetector:
                 if idx % every_n != 0:
                     idx += 1
                     continue
-
-                frame = self._ensure_bgr3(frame)
 
                 # Inference and counting
                 if score_thr is not None:
@@ -385,6 +618,8 @@ class MmdetBBoxDetector:
         Regenerate a video with bounding boxes drawn (using `draw`) and a count
         of detections overlaid at the bottom-right corner of each frame.
 
+        Note: If input video is transcoded, a temp file may be created (OS will clean up or you may remove).
+
         Args:
             video_path: Path to the input video file.
             out_path: Output video path (e.g., "out/annotated.mp4").
@@ -401,9 +636,10 @@ class MmdetBBoxDetector:
         """
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-        cap = cv2.VideoCapture(video_path)
+        safe_video = self._prepare_video_path(video_path, force=self.force_transcode)
+        cap = cv2.VideoCapture(safe_video)
         if not cap.isOpened():
-            raise FileNotFoundError(f"Cannot open video: {video_path}")
+            raise FileNotFoundError(f"Cannot open video: {safe_video}")
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         if not fps or fps <= 0:
@@ -428,7 +664,6 @@ class MmdetBBoxDetector:
                 if not ret:
                     break
 
-                frame = self._ensure_bgr3(frame)
 
                 # Run detection based on sampling policy
                 run_det = (idx % every_n == 0) or (last_pred is None)
@@ -474,6 +709,13 @@ def main():
     ap.add_argument("--ckpt", default="checkpoints/faster_rcnn_r50_fpn_2x_coco_bbox_mAP-0.384_20200504_210434-a5d8aa15.pth")
     ap.add_argument("--device", default="cuda:0", help="cuda:0 or cpu")
     ap.add_argument("--thr", type=float, default=0.5, help="score threshold")
+    ap.add_argument("--force-transcode", action="store_true", default=False,
+                    help="Force re-encode input video to yuv420p before processing (avoids swscale slice errors)")
+    ap.add_argument('--fast-transcode', action='store_true', default=False,
+                    help='Faster but less defensive transcode (smaller probe sizes).')
+    ap.add_argument('--nvenc', dest='use_nvenc', action='store_true', help='Force NVENC if available')
+    ap.add_argument('--no-nvenc', dest='use_nvenc', action='store_false', help='Disable NVENC even if available')
+    ap.set_defaults(use_nvenc=None)
 
     # Modes
     ap.add_argument("--img", help="Path to an image to annotate")
@@ -484,7 +726,12 @@ def main():
 
     args = ap.parse_args()
 
-    det = MmdetBBoxDetector(args.config, args.ckpt, device=args.device, score_thr=args.thr)
+    det = MmdetBBoxDetector(
+        args.config, args.ckpt, device=args.device, score_thr=args.thr,
+        force_transcode=bool(getattr(args, 'force_transcode', False)),
+        fast_transcode=bool(getattr(args, 'fast_transcode', False)),
+        use_nvenc=getattr(args, 'use_nvenc', None),
+    )
 
     # Image mode
     if args.img:
